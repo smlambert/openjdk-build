@@ -3,7 +3,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+#      https://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,44 +17,51 @@ MAINTAINER AdoptOpenJDK <adoption-discuss@openjdk.java.net>
 
 # Install required OS tools
 RUN apt-get update \
+  && apt-get -y upgrade \
   && apt-get install -qq -y --no-install-recommends \
+    ccache \
     cpio \
-    make \
-    gcc \
-    g++ \
+    curl \
     file \
+    g++ \
+    gcc \
+    git \
+    libasound2-dev \
+    libcups2-dev \
+    libelf-dev \
+    libfontconfig1-dev \
+    libfreetype6-dev \
     libx11-dev \
     libxext-dev \
     libxrender-dev \
-    libxtst-dev \
     libxt-dev \
-    libelf-dev \
-    libcups2-dev \
-    libfreetype6-dev \
-    libasound2-dev \
+    libxtst-dev \
+    make \
     openjdk-8-jdk \
-    ccache \
-    zip \
-    wget \
-    git \
-    unzip \
     realpath \
+    unzip \
+    wget \
+    zip \
+    ssh \
+
 && rm -rf /var/lib/apt/lists/*
 
 # Pick up build instructions
 RUN mkdir -p /openjdk/target
 
-ADD sbin /openjdk/sbin
+COPY sbin /openjdk/sbin
+COPY workspace/config /openjdk/config
 
+RUN mkdir -p /openjdk/build
+RUN useradd -ms /bin/bash build
+RUN chown -R build: /openjdk/
+USER build
 WORKDIR /openjdk/build/
-
-ENV JDK_BOOT_DIR=/usr/lib/jvm/java-1.8.0-openjdk-amd64
 
 # Default actions
 ENTRYPOINT ["/openjdk/sbin/build.sh"]
 
 CMD ["images"]
-
 
 ARG OPENJDK_CORE_VERSION
 ENV OPENJDK_CORE_VERSION=$OPENJDK_CORE_VERSION
