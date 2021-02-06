@@ -27,41 +27,46 @@ limitations under the License.
  *
  * This:
  *
- * 1. Generate job for each configuration based on  create_job_from_template.groovy
+ * 1. Generate job for each configuration based on create_job_from_template.groovy
  * 2. Execute job
  * 3. Push generated artifacts to github
  */
 //@CompileStatic(extensions = "JenkinsTypeCheckHelperExtension")
 class Builder implements Serializable {
     String javaToBuild
-    String activeNodeTimeout
-    String adoptBuildNumber
-    String overrideFileNameVersion
-    String additionalBuildArgs
-    String additionalConfigureArgs
-    Map<String, List<String>> targetConfigurations
     Map<String, Map<String, ?>> buildConfigurations
+    Map<String, List<String>> targetConfigurations
+    Map<String, ?> DEFAULTS_JSON
+    String activeNodeTimeout
     Map<String, List<String>> dockerExcludes
-    String scmReference
-    String publishName
-
-    boolean release
-    boolean publish
     boolean enableTests
     boolean enableInstallers
     boolean enableSigner
+    boolean publish
+    boolean release
+    String releaseType
+    String scmReference
+    String publishName
+    String additionalConfigureArgs
+    def scmVars
+    String additionalBuildArgs
+    String overrideFileNameVersion
+    String adoptBuildNumber
+    boolean useAdoptShellScripts
     boolean cleanWorkspaceBeforeBuild
+    boolean cleanWorkspaceAfterBuild
+    boolean cleanWorkspaceBuildOutputAfterBuild
     boolean propagateFailures
     boolean keepTestReportDir
+    boolean keepReleaseLogs
 
-    def env
-    def scmVars
-    def context
     def currentBuild
+    def context
+    def env
 
-    /* 
-    Test targets triggered in 'nightly' build pipelines running 6 days per week 
-    nightly + weekly to be run during a 'release' pipeline 
+    /*
+    Test targets triggered in 'nightly' build pipelines running 6 days per week
+    nightly + weekly to be run during a 'release' pipeline
     */
     final List<String> nightly = [
         'sanity.openjdk',
@@ -71,9 +76,10 @@ class Builder implements Serializable {
         'sanity.functional',
         'extended.functional'
     ]
-    /* 
-    Test targets triggered in 'weekly' build pipelines running once per week 
-    nightly + weekly to be run during a 'release' pipeline 
+
+    /*
+    Test targets triggered in 'weekly' build pipelines running once per week
+    nightly + weekly to be run during a 'release' pipeline
     */
     final List<String> weekly = [
         'extended.openjdk',
@@ -110,6 +116,8 @@ class Builder implements Serializable {
 
         def dockerNode = getDockerNode(platformConfig, variant)
 
+        def platformSpecificConfigPath = getPlatformSpecificConfigPath(platformConfig)
+
         def buildArgs = getBuildArgs(platformConfig, variant)
 
         if (additionalBuildArgs) {
@@ -118,44 +126,56 @@ class Builder implements Serializable {
 
         def testList = getTestList(platformConfig)
 
+        def platformCleanWorkspaceAfterBuild = getCleanWorkspaceAfterBuild(platformConfig)
+
         // Always clean on mac due to https://github.com/AdoptOpenJDK/openjdk-build/issues/1980
         def cleanWorkspace = cleanWorkspaceBeforeBuild
         if (platformConfig.os == "mac") {
             cleanWorkspace = true
         }
 
+        def cleanWsAfter = cleanWorkspaceAfterBuild
+        if (platformCleanWorkspaceAfterBuild) {
+            // Platform override specified
+            cleanWsAfter = platformCleanWorkspaceAfterBuild
+        }
+
         return new IndividualBuildConfig(
-                JAVA_TO_BUILD: javaToBuild,
-                ARCHITECTURE: platformConfig.arch as String,
-                TARGET_OS: platformConfig.os as String,
-                VARIANT: variant,
-                TEST_LIST: testList,
-                SCM_REF: scmReference,
-                BUILD_ARGS: buildArgs,
-                NODE_LABEL: "${additionalNodeLabels}&&${platformConfig.os}&&${archLabel}",
-                ADDITIONAL_TEST_LABEL: "${additionalTestLabels}",
-                KEEP_TEST_REPORTDIR: keepTestReportDir,
-                ACTIVE_NODE_TIMEOUT: activeNodeTimeout,
-                CODEBUILD: platformConfig.codebuild as Boolean,
-                DOCKER_IMAGE: dockerImage,
-                DOCKER_FILE: dockerFile,
-                DOCKER_NODE: dockerNode,
-                CONFIGURE_ARGS: getConfigureArgs(platformConfig, additionalConfigureArgs, variant),
-                OVERRIDE_FILE_NAME_VERSION: overrideFileNameVersion,
-                ADDITIONAL_FILE_NAME_TAG: platformConfig.additionalFileNameTag as String,
-                JDK_BOOT_VERSION: platformConfig.bootJDK as String,
-                RELEASE: release,
-                PUBLISH_NAME: publishName,
-                ADOPT_BUILD_NUMBER: adoptBuildNumber,
-                ENABLE_TESTS: enableTests,
-                ENABLE_INSTALLERS: enableInstallers,
-                ENABLE_SIGNER: enableSigner,
-                CLEAN_WORKSPACE: cleanWorkspace
+            JAVA_TO_BUILD: javaToBuild,
+            ARCHITECTURE: platformConfig.arch as String,
+            TARGET_OS: platformConfig.os as String,
+            VARIANT: variant,
+            TEST_LIST: testList,
+            SCM_REF: scmReference,
+            BUILD_ARGS: buildArgs,
+            NODE_LABEL: "${additionalNodeLabels}&&${platformConfig.os}&&${archLabel}",
+            ADDITIONAL_TEST_LABEL: "${additionalTestLabels}",
+            KEEP_TEST_REPORTDIR: keepTestReportDir,
+            ACTIVE_NODE_TIMEOUT: activeNodeTimeout,
+            CODEBUILD: platformConfig.codebuild as Boolean,
+            DOCKER_IMAGE: dockerImage,
+            DOCKER_FILE: dockerFile,
+            DOCKER_NODE: dockerNode,
+            PLATFORM_CONFIG_LOCATION: platformSpecificConfigPath,
+            CONFIGURE_ARGS: getConfigureArgs(platformConfig, additionalConfigureArgs, variant),
+            OVERRIDE_FILE_NAME_VERSION: overrideFileNameVersion,
+            USE_ADOPT_SHELL_SCRIPTS: useAdoptShellScripts,
+            ADDITIONAL_FILE_NAME_TAG: platformConfig.additionalFileNameTag as String,
+            JDK_BOOT_VERSION: platformConfig.bootJDK as String,
+            RELEASE: release,
+            PUBLISH_NAME: publishName,
+            ADOPT_BUILD_NUMBER: adoptBuildNumber,
+            ENABLE_TESTS: enableTests,
+            ENABLE_INSTALLERS: enableInstallers,
+            ENABLE_SIGNER: enableSigner,
+            CLEAN_WORKSPACE: cleanWorkspace,
+            CLEAN_WORKSPACE_AFTER: cleanWsAfter,
+            CLEAN_WORKSPACE_BUILD_OUTPUT_ONLY_AFTER: cleanWorkspaceBuildOutputAfterBuild
         )
     }
 
     /*
-    Returns true if possibleMap is a Map. False otherwise. 
+    Returns true if possibleMap is a Map. False otherwise.
     */
     static def isMap(possibleMap) {
         return Map.class.isInstance(possibleMap)
@@ -180,20 +200,23 @@ class Builder implements Serializable {
 
         return ""
     }
-    
+
     /*
     Get the list of tests to run from the build configurations.
     We run different test categories depending on if this build is a release or nightly. This function parses and applies this to the individual build config.
     */
     List<String> getTestList(Map<String, ?> configuration) {
         List<String> testList = []
-        /* 
+        /*
         * No test key or key value is test: false  --- test disabled
-        * Key value is test: 'default' --- nightly build trigger 'nightly' test set, release build trigger 'nightly' + 'weekly' test sets
+        * Key value is test: 'default' --- nightly build trigger 'nightly' test set, weekly build trigger or release build trigger 'nightly' + 'weekly' test sets
         * Key value is test: [customized map] specified nightly and weekly test lists
         */
         if (configuration.containsKey("test") && configuration.get("test")) {
-            def testJobType = release ? "release" : "nightly"
+            def testJobType = "nightly"
+            if (releaseType.equals("Weekly") || releaseType.equals("Release")) {
+                testJobType = "weekly"
+            }
 
             if (isMap(configuration.test)) {
 
@@ -204,7 +227,7 @@ class Builder implements Serializable {
                 }
 
             } else {
-                
+
                 // Default to the test sets declared if one isn't set in the build configuration
                 if ( testJobType == "nightly" ) {
                     testList = nightly
@@ -220,13 +243,25 @@ class Builder implements Serializable {
     }
 
     /*
+    Get the cleanWorkspaceAfterBuild override for this platform configuration
+    */
+    Boolean getCleanWorkspaceAfterBuild(Map<String, ?> configuration) {
+        Boolean cleanWorkspaceAfterBuild = null
+        if (configuration.containsKey("cleanWorkspaceAfterBuild") && configuration.get("cleanWorkspaceAfterBuild")) {
+            cleanWorkspaceAfterBuild = configuration.cleanWorkspaceAfterBuild as Boolean
+        }
+
+        return cleanWorkspaceAfterBuild
+    }
+
+    /*
     Parses and applies the dockerExcludes parameter.
     Any platforms/variants that are declared in this parameter are marked as excluded from docker building via this function. Even if they have a docker image or file declared in the build configurations!
     */
     def dockerOverride(Map<String, ?> configuration, String variant) {
         Boolean overrideDocker = false
         if (dockerExcludes == {}) {
-            return overrideDocker 
+            return overrideDocker
         }
 
         String stringArch = configuration.arch as String
@@ -312,6 +347,24 @@ class Builder implements Serializable {
             }
         }
         return dockerNodeValue
+    }
+
+    /*
+    Retrieves the platformSpecificConfigPath from the build configurations.
+    This determines where the location of the operating system setup files are in comparison to the repository root. The param is formatted like this because we need to download and source the file from the bash scripts.
+    */
+    def getPlatformSpecificConfigPath(Map<String, ?> configuration) {
+        def splitUserUrl = ((String)DEFAULTS_JSON['repository']['url']).minus(".git").split('/')
+        // e.g. https://github.com/AdoptOpenJDK/openjdk-build.git will produce AdoptOpenJDK/openjdk-build
+        String userOrgRepo = "${splitUserUrl[splitUserUrl.size() - 2]}/${splitUserUrl[splitUserUrl.size() - 1]}"
+
+        // e.g. AdoptOpenJDK/openjdk-build/master/build-farm/platform-specific-configurations
+        def platformSpecificConfigPath = "${userOrgRepo}/${DEFAULTS_JSON['repository']['branch']}/${DEFAULTS_JSON['configDirectories']['platform']}"
+        if (configuration.containsKey("platformSpecificConfigPath")) {
+            // e.g. AdoptOpenJDK/openjdk-build/master/build-farm/platform-specific-configurations.linux.sh
+            platformSpecificConfigPath = "${userOrgRepo}/${DEFAULTS_JSON['repository']['branch']}/${configuration.platformSpecificConfigPath}"
+        }
+        return platformSpecificConfigPath
     }
 
     /*
@@ -445,13 +498,11 @@ class Builder implements Serializable {
                     context.println "Found Java Version Number: ${headVersion}"
                 }
             } catch (FlowInterruptedException e) {
-                context.println "[ERROR] Adopt API Request timeout (${pipelineTimeouts.API_REQUEST_TIMEOUT} HOURS) has been reached. Exiting..."
-                throw new Exception()
+                throw new Exception("[ERROR] Adopt API Request timeout (${pipelineTimeouts.API_REQUEST_TIMEOUT} HOURS) has been reached. Exiting...")
             }
             return headVersion
         } else {
-            context.error("Failed to read java version '${javaToBuild}'")
-            throw new Exception()
+            throw new Exception("Failed to read java version '${javaToBuild}'")
         }
     }
 
@@ -503,7 +554,7 @@ class Builder implements Serializable {
         return true
     }
 
-    /* 
+    /*
     Call job to push artifacts to github. Usually it's only executed on a nightly build
     */
     def publishBinary() {
@@ -547,8 +598,8 @@ class Builder implements Serializable {
 
             if (release) {
                 if (publishName) {
-                    // Only keep release logs for real releases, not the weekend weekly release test builds that are not published
-                    currentBuild.setKeepLog(true)
+                    // Keep Jenkins release logs for real releases
+                    currentBuild.setKeepLog(keepReleaseLogs)
                     currentBuild.setDisplayName(publishName)
                 }
             }
@@ -560,10 +611,12 @@ class Builder implements Serializable {
             context.echo "Enable tests: ${enableTests}"
             context.echo "Enable Installers: ${enableInstallers}"
             context.echo "Enable Signer: ${enableSigner}"
+            context.echo "Use Adopt's Scripts: ${useAdoptShellScripts}"
             context.echo "Publish: ${publish}"
             context.echo "Release: ${release}"
             context.echo "Tag/Branch name: ${scmReference}"
             context.echo "Keep test reportdir: ${keepTestReportDir}"
+            context.echo "Keey release logs: ${keepReleaseLogs}"
 
             jobConfigurations.each { configuration ->
                 jobs[configuration.key] = {
@@ -573,7 +626,7 @@ class Builder implements Serializable {
                     def jobTopName = getJobName(configuration.key)
                     def jobFolder = getJobFolder()
 
-                    // i.e jdk10u/job/jdk11u-linux-x64-hotspot
+                    // i.e jdk11u/job/jdk11u-linux-x64-hotspot
                     def downstreamJobName = "${jobFolder}/${jobTopName}"
                     context.echo "build name " + downstreamJobName
 
@@ -581,7 +634,7 @@ class Builder implements Serializable {
                         // Execute build job for configuration i.e jdk11u/job/jdk11u-linux-x64-hotspot
                         context.stage(configuration.key) {
                             context.echo "Created job " + downstreamJobName
-                            
+
                             // execute build
                             def downstreamJob = context.build job: downstreamJobName, propagate: false, parameters: config.toBuildParams()
 
@@ -597,9 +650,8 @@ class Builder implements Serializable {
                                                 context.sh "rm target/${config.TARGET_OS}/${config.ARCHITECTURE}/${config.VARIANT}/* || true"
                                             }
                                         } catch (FlowInterruptedException e) {
-                                            context.println "[ERROR] Previous artifact removal timeout (${pipelineTimeouts.REMOVE_ARTIFACTS_TIMEOUT} HOURS) for ${downstreamJobName} has been reached. Exiting..."
-                                            throw new Exception()
-                                        }   
+                                            throw new Exception("[ERROR] Previous artifact removal timeout (${pipelineTimeouts.REMOVE_ARTIFACTS_TIMEOUT} HOURS) for ${downstreamJobName} has been reached. Exiting...")
+                                        }
 
                                         try {
                                             context.timeout(time: pipelineTimeouts.COPY_ARTIFACTS_TIMEOUT, unit: "HOURS") {
@@ -613,8 +665,7 @@ class Builder implements Serializable {
                                                 )
                                             }
                                         } catch (FlowInterruptedException e) {
-                                            context.println "[ERROR] Copy artifact timeout (${pipelineTimeouts.COPY_ARTIFACTS_TIMEOUT} HOURS) for ${downstreamJobName} has been reached. Exiting..."
-                                            throw new Exception()
+                                            throw new Exception("[ERROR] Copy artifact timeout (${pipelineTimeouts.COPY_ARTIFACTS_TIMEOUT} HOURS) for ${downstreamJobName} has been reached. Exiting...")
                                         }
 
                                         // Checksum
@@ -626,8 +677,7 @@ class Builder implements Serializable {
                                                 context.archiveArtifacts artifacts: "target/${config.TARGET_OS}/${config.ARCHITECTURE}/${config.VARIANT}/*"
                                             }
                                         } catch (FlowInterruptedException e) {
-                                            context.println "[ERROR] Archive artifact timeout (${pipelineTimeouts.ARCHIVE_ARTIFACTS_TIMEOUT} HOURS) for ${downstreamJobName}has been reached. Exiting..."
-                                            throw new Exception()
+                                            throw new Exception("[ERROR] Archive artifact timeout (${pipelineTimeouts.ARCHIVE_ARTIFACTS_TIMEOUT} HOURS) for ${downstreamJobName}has been reached. Exiting...")
                                         }
 
                                     }
@@ -637,7 +687,6 @@ class Builder implements Serializable {
                                 context.error("Build failed due to downstream failure of ${downstreamJobName}")
                                 currentBuild.result = "FAILURE"
                             }
-
                         }
                     }
                 }
@@ -653,8 +702,7 @@ class Builder implements Serializable {
                         publishBinary()
                     }
                 } catch (FlowInterruptedException e) {
-                    context.println "[ERROR] Publish binary timeout (${pipelineTimeouts.PUBLISH_ARTIFACTS_TIMEOUT} HOURS) has been reached OR the downstream publish job failed. Exiting..."
-                    throw new Exception()
+                    throw new Exception("[ERROR] Publish binary timeout (${pipelineTimeouts.PUBLISH_ARTIFACTS_TIMEOUT} HOURS) has been reached OR the downstream publish job failed. Exiting...")
                 }
             } else if (publish && release) {
                 context.println "NOT PUBLISHING RELEASE AUTOMATICALLY"
@@ -668,6 +716,7 @@ return {
     String javaToBuild,
     Map<String, Map<String, ?>> buildConfigurations,
     String targetConfigurations,
+    Map<String, ?> DEFAULTS_JSON,
     String activeNodeTimeout,
     String dockerExcludes,
     String enableTests,
@@ -676,14 +725,18 @@ return {
     String releaseType,
     String scmReference,
     String overridePublishName,
+    String useAdoptShellScripts,
     String additionalConfigureArgs,
     def scmVars,
     String additionalBuildArgs,
     String overrideFileNameVersion,
     String cleanWorkspaceBeforeBuild,
+    String cleanWorkspaceAfterBuild,
+    String cleanWorkspaceBuildOutputAfterBuild,
     String adoptBuildNumber,
     String propagateFailures,
     String keepTestReportDir,
+    String keepReleaseLogs,
     def currentBuild,
     def context,
     def env ->
@@ -694,7 +747,7 @@ return {
         }
 
         boolean publish = false
-        if (releaseType == 'Nightly') {
+        if (releaseType == 'Nightly' || releaseType == 'Weekly') {
             publish = true
         }
 
@@ -717,6 +770,7 @@ return {
             javaToBuild: javaToBuild,
             buildConfigurations: buildConfigurations,
             targetConfigurations: new JsonSlurper().parseText(targetConfigurations) as Map,
+            DEFAULTS_JSON: DEFAULTS_JSON,
             activeNodeTimeout: activeNodeTimeout,
             dockerExcludes: buildsExcludeDocker,
             enableTests: Boolean.parseBoolean(enableTests),
@@ -724,16 +778,21 @@ return {
             enableSigner: Boolean.parseBoolean(enableSigner),
             publish: publish,
             release: release,
+            releaseType: releaseType,
             scmReference: scmReference,
             publishName: publishName,
             additionalConfigureArgs: additionalConfigureArgs,
             scmVars: scmVars,
             additionalBuildArgs: additionalBuildArgs,
             overrideFileNameVersion: overrideFileNameVersion,
+            useAdoptShellScripts: Boolean.parseBoolean(useAdoptShellScripts),
             cleanWorkspaceBeforeBuild: Boolean.parseBoolean(cleanWorkspaceBeforeBuild),
+            cleanWorkspaceAfterBuild: Boolean.parseBoolean(cleanWorkspaceAfterBuild),
+            cleanWorkspaceBuildOutputAfterBuild: Boolean.parseBoolean(cleanWorkspaceBuildOutputAfterBuild),
             adoptBuildNumber: adoptBuildNumber,
             propagateFailures: Boolean.parseBoolean(propagateFailures),
             keepTestReportDir: Boolean.parseBoolean(keepTestReportDir),
+            keepReleaseLogs: Boolean.parseBoolean(keepReleaseLogs),
             currentBuild: currentBuild,
             context: context,
             env: env

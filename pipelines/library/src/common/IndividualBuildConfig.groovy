@@ -19,8 +19,10 @@ class IndividualBuildConfig implements Serializable {
     final String DOCKER_IMAGE
     final String DOCKER_FILE
     final String DOCKER_NODE
+    final String PLATFORM_CONFIG_LOCATION
     final String CONFIGURE_ARGS
     final String OVERRIDE_FILE_NAME_VERSION
+    final boolean USE_ADOPT_SHELL_SCRIPTS
     final String ADDITIONAL_FILE_NAME_TAG
     final String JDK_BOOT_VERSION
     final boolean RELEASE
@@ -30,6 +32,8 @@ class IndividualBuildConfig implements Serializable {
     final boolean ENABLE_INSTALLERS
     final boolean ENABLE_SIGNER
     final boolean CLEAN_WORKSPACE
+    final boolean CLEAN_WORKSPACE_AFTER
+    final boolean CLEAN_WORKSPACE_BUILD_OUTPUT_ONLY_AFTER
 
     IndividualBuildConfig(String json) {
         this(new JsonSlurper().parseText(json) as Map)
@@ -59,8 +63,10 @@ class IndividualBuildConfig implements Serializable {
         DOCKER_IMAGE = map.get("DOCKER_IMAGE")
         DOCKER_FILE = map.get("DOCKER_FILE")
         DOCKER_NODE = map.get("DOCKER_NODE")
+        PLATFORM_CONFIG_LOCATION = map.get("PLATFORM_CONFIG_LOCATION")
         CONFIGURE_ARGS = map.get("CONFIGURE_ARGS")
         OVERRIDE_FILE_NAME_VERSION = map.get("OVERRIDE_FILE_NAME_VERSION")
+        USE_ADOPT_SHELL_SCRIPTS = map.get("USE_ADOPT_SHELL_SCRIPTS")
         ADDITIONAL_FILE_NAME_TAG = map.get("ADDITIONAL_FILE_NAME_TAG")
         JDK_BOOT_VERSION = map.get("JDK_BOOT_VERSION")
         RELEASE = map.get("RELEASE")
@@ -70,6 +76,8 @@ class IndividualBuildConfig implements Serializable {
         ENABLE_INSTALLERS = map.get("ENABLE_INSTALLERS")
         ENABLE_SIGNER = map.get("ENABLE_SIGNER")
         CLEAN_WORKSPACE = map.get("CLEAN_WORKSPACE")
+        CLEAN_WORKSPACE_AFTER = map.get("CLEAN_WORKSPACE_AFTER")
+        CLEAN_WORKSPACE_BUILD_OUTPUT_ONLY_AFTER = map.get("CLEAN_WORKSPACE_BUILD_OUTPUT_ONLY_AFTER")
     }
 
     Map<String, ?> toMap() {
@@ -104,8 +112,10 @@ class IndividualBuildConfig implements Serializable {
                 DOCKER_IMAGE              : DOCKER_IMAGE,
                 DOCKER_FILE               : DOCKER_FILE,
                 DOCKER_NODE               : DOCKER_NODE,
+                PLATFORM_CONFIG_LOCATION  : PLATFORM_CONFIG_LOCATION,
                 CONFIGURE_ARGS            : CONFIGURE_ARGS,
                 OVERRIDE_FILE_NAME_VERSION: OVERRIDE_FILE_NAME_VERSION,
+                USE_ADOPT_SHELL_SCRIPTS   : USE_ADOPT_SHELL_SCRIPTS,
                 ADDITIONAL_FILE_NAME_TAG  : ADDITIONAL_FILE_NAME_TAG,
                 JDK_BOOT_VERSION          : JDK_BOOT_VERSION,
                 RELEASE                   : RELEASE,
@@ -114,7 +124,9 @@ class IndividualBuildConfig implements Serializable {
                 ENABLE_TESTS              : ENABLE_TESTS,
                 ENABLE_INSTALLERS         : ENABLE_INSTALLERS,
                 ENABLE_SIGNER             : ENABLE_SIGNER,
-                CLEAN_WORKSPACE           : CLEAN_WORKSPACE
+                CLEAN_WORKSPACE           : CLEAN_WORKSPACE,
+                CLEAN_WORKSPACE_AFTER     : CLEAN_WORKSPACE_AFTER,
+                CLEAN_WORKSPACE_BUILD_OUTPUT_ONLY_AFTER : CLEAN_WORKSPACE_BUILD_OUTPUT_ONLY_AFTER
         ]
     }
 

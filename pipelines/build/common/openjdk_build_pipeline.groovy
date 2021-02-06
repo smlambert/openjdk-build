@@ -2,6 +2,7 @@ import common.IndividualBuildConfig
 import common.MetaData
 @Library('local-lib@master')
 import common.VersionInfo
+import common.RepoHandler
 import groovy.json.*
 import java.nio.file.NoSuchFileException
 import org.jenkinsci.plugins.workflow.steps.FlowInterruptedException
@@ -43,10 +44,13 @@ limitations under the License.
 
 class Build {
     final IndividualBuildConfig buildConfig
-
+    final Map USER_REMOTE_CONFIGS
+    final Map DEFAULTS_JSON
+    final Map ADOPT_DEFAULTS_JSON
     final def context
     final def env
     final def currentBuild
+
     VersionInfo versionInfo = null
     String scmRef = ""
     String fullVersionOutput = ""
@@ -67,7 +71,6 @@ class Build {
         NODE_CHECKOUT_TIMEOUT : 1,
         BUILD_JDK_TIMEOUT : 8,
         BUILD_ARCHIVE_TIMEOUT : 3,
-        AIX_CLEAN_TIMEOUT : 1,
         MASTER_CLEAN_TIMEOUT : 1,
         DOCKER_CHECKOUT_TIMEOUT : 1,
         DOCKER_PULL_TIMEOUT : 2
@@ -76,8 +79,19 @@ class Build {
     /*
     Constructor
     */
-    Build(IndividualBuildConfig buildConfig, def context, def env, def currentBuild) {
+    Build(
+        IndividualBuildConfig buildConfig,
+        Map USER_REMOTE_CONFIGS,
+        Map DEFAULTS_JSON,
+        Map ADOPT_DEFAULTS_JSON,
+        def context,
+        def env,
+        def currentBuild
+    ) {
         this.buildConfig = buildConfig
+        this.USER_REMOTE_CONFIGS = USER_REMOTE_CONFIGS
+        this.DEFAULTS_JSON = DEFAULTS_JSON
+        this.ADOPT_DEFAULTS_JSON = ADOPT_DEFAULTS_JSON
         this.context = context
         this.currentBuild = currentBuild
         this.env = env
@@ -106,13 +120,11 @@ class Build {
                     context.println "Found Java Version Number: ${headVersion}"
                 }
             } catch (FlowInterruptedException e) {
-                context.println "[ERROR] Adopt API Request timeout (${buildTimeouts.API_REQUEST_TIMEOUT} HOURS) has been reached. Exiting..."
-                throw new Exception()
+                throw new Exception("[ERROR] Adopt API Request timeout (${buildTimeouts.API_REQUEST_TIMEOUT} HOURS) has been reached. Exiting...")
             }
             return headVersion
         } else {
-            context.error("Failed to read java version '${javaToBuild}'")
-            throw new Exception()
+            throw new Exception("Failed to read java version '${javaToBuild}'")
         }
     }
 
@@ -158,7 +170,12 @@ class Build {
         def jdkBranch
 
         if (buildConfig.SCM_REF) {
-            jdkBranch = buildConfig.SCM_REF
+            // We need to override the SCM ref on jdk8 arm builds change aarch64-shenandoah-jdk8u282-b08 to jdk8u282-b08
+            if (buildConfig.JAVA_TO_BUILD == "jdk8u" &&  buildConfig.VARIANT == "hotspot" && (buildConfig.ARCHITECTURE == "aarch64" || buildConfig.ARCHITECTURE == "arm")) {
+                jdkBranch = buildConfig.OVERRIDE_FILE_NAME_VERSION
+            } else {
+                jdkBranch = buildConfig.SCM_REF
+            }
         } else {
             if (buildConfig.VARIANT == "corretto") {
                 jdkBranch = 'develop'
@@ -169,8 +186,7 @@ class Build {
             } else if (buildConfig.VARIANT == "dragonwell") {
                 jdkBranch = 'master'
             } else {
-                context.error("Unrecognised build variant '${buildConfig.VARIANT}' ")
-                throw new Exception()
+                throw new Exception("Unrecognised build variant: ${buildConfig.VARIANT} ")
             }
         }
 
@@ -189,14 +205,18 @@ class Build {
         if (buildConfig.VARIANT == "corretto") {
             suffix="corretto/corretto-${javaNumber}"
         } else if (buildConfig.VARIANT == "openj9") {
-            suffix = "ibmruntimes/openj9-openjdk-jdk${javaNumber}"
+            def openj9JavaToBuild = buildConfig.JAVA_TO_BUILD
+            if (openj9JavaToBuild.endsWith("u")) {
+                // OpenJ9 extensions repo does not use the "u" suffix
+                openj9JavaToBuild = openj9JavaToBuild.substring(0, openj9JavaToBuild.length() - 1)
+            }
+            suffix = "ibmruntimes/openj9-openjdk-${openj9JavaToBuild}"
         } else if (buildConfig.VARIANT == "hotspot") {
             suffix = "adoptopenjdk/openjdk-${buildConfig.JAVA_TO_BUILD}"
         } else if (buildConfig.VARIANT == "dragonwell") {
             suffix = "alibaba/dragonwell${javaNumber}"
         } else {
-            context.error("Unrecognised build variant '${buildConfig.VARIANT}' ")
-            throw new Exception()
+            throw new Exception("Unrecognised build variant: ${buildConfig.VARIANT} ")
         }
 
         jdkRepo = "https://github.com/${suffix}"
@@ -240,10 +260,10 @@ class Build {
 							keep_test_reportdir = "true"
 						}
 
-						// example jobName: Test_openjdk11_hs_sanity.system_ppc64_aix
-						def jobName = determineTestJobName(testType)
+                        // example jobName: Test_openjdk11_hs_sanity.system_ppc64_aix
+                        def jobName = determineTestJobName(testType)
 
-						def JobHelper = context.library(identifier: 'openjdk-jenkins-helper@master').JobHelper
+                        def JobHelper = context.library(identifier: 'openjdk-jenkins-helper@master').JobHelper
 
                         // Execute test job
 						if (JobHelper.jobIsRunnable(jobName as String)) {
@@ -267,7 +287,7 @@ class Build {
 					}
 				}
 			} catch (Exception e) {
-				context.println "Failed execute test: ${e.getLocalizedMessage()}"
+				context.println "Failed to execute test: ${e.getLocalizedMessage()}"
 			}
         }
         return testStages
@@ -332,14 +352,8 @@ class Build {
 
                 // Execute sign job
                 def signJob = context.build job: "build-scripts/release/sign_build",
-                        propagate: true,
-                        parameters: params
-
-                // Output notification of downstream failure (the build will fail automatically)
-                def jobResult = signJob.getResult()
-                if (jobResult != 'SUCCESS') {
-                    context.println "ERROR: downstream sign_build ${jobResult}.\nSee ${signJob.getAbsoluteUrl()} for details"
-                }
+                    propagate: true,
+                    parameters: params
 
                 context.node('master') {
                     //Copy signed artifact back and archive again
@@ -437,7 +451,7 @@ class Build {
         if (versionData.major == 8) {
             buildNumber = String.format("%02d", versionData.build)
         }
-        
+
         def INSTALLER_ARCH = "${buildConfig.ARCHITECTURE}"
         // Wix toolset requires aarch64 builds to be called arm64
         if (buildConfig.ARCHITECTURE == "aarch64") {
@@ -605,8 +619,7 @@ class Build {
                 fullVersionOutput = context.readFile(versionPath)
                 context.println "SUCCESS: ${versionPath} found"
             } catch (NoSuchFileException e) {
-                context.println "ERROR: ${versionPath} was not found. Exiting..."
-                throw new Exception()
+                throw new Exception("ERROR: ${versionPath} was not found. Exiting...")
             }
 
             // Get Configure Args
@@ -617,8 +630,7 @@ class Build {
                 configureArguments = context.readFile(configurePath)
                 context.println "SUCCESS: configure.txt found"
             } catch (NoSuchFileException e) {
-                context.println "ERROR: ${configurePath} was not found. Exiting..."
-                throw new Exception()
+                throw new Exception("ERROR: ${configurePath} was not found. Exiting...")
             }
 
             // Get Variant Version for OpenJ9
@@ -635,8 +647,7 @@ class Build {
                     j9Major = context.readFile(j9MajorPath)
                     context.println "SUCCESS: major.txt found"
                 } catch (NoSuchFileException e) {
-                    context.println "ERROR: ${j9MajorPath} was not found. Exiting..."
-                    throw new Exception()
+                    throw new Exception("ERROR: ${j9MajorPath} was not found. Exiting...")
                 }
 
                 context.println "INFO: Attempting to read workspace/target/metadata/variant_version/minor.txt..."
@@ -644,8 +655,7 @@ class Build {
                     j9Minor = context.readFile(j9MinorPath)
                     context.println "SUCCESS: minor.txt found"
                 } catch (NoSuchFileException e) {
-                    context.println "ERROR: ${j9MinorPath} was not found. Exiting..."
-                    throw new Exception()
+                    throw new Exception("ERROR: ${j9MinorPath} was not found. Exiting...")
                 }
 
                 context.println "INFO: Attempting to read workspace/target/metadata/variant_version/security.txt..."
@@ -653,8 +663,7 @@ class Build {
                     j9Security = context.readFile(j9SecurityPath)
                     context.println "SUCCESS: security.txt found"
                 } catch (NoSuchFileException e) {
-                    context.println "ERROR: ${j9SecurityPath} was not found. Exiting..."
-                    throw new Exception()
+                    throw new Exception("ERROR: ${j9SecurityPath} was not found. Exiting...")
                 }
 
                 context.println "INFO: Attempting to read workspace/target/metadata/variant_version/tags.txt..."
@@ -662,8 +671,7 @@ class Build {
                     j9Tags = context.readFile(j9TagsPath)
                     context.println "SUCCESS: tags.txt found"
                 } catch (NoSuchFileException e) {
-                    context.println "ERROR: ${j9TagsPath} was not found. Exiting..."
-                    throw new Exception()
+                    throw new Exception("ERROR: ${j9TagsPath} was not found. Exiting...")
                 }
 
                 variantVersion = [major: j9Major, minor: j9Minor, security: j9Security, tags: j9Tags]
@@ -677,8 +685,7 @@ class Build {
                 vendorName = context.readFile(vendorPath)
                 context.println "SUCCESS: vendor.txt found"
             } catch (NoSuchFileException e) {
-                context.println "ERROR: ${vendorPath} was not found. Exiting..."
-                throw new Exception()
+                throw new Exception("ERROR: ${vendorPath} was not found. Exiting...")
             }
 
             // Get Build Source
@@ -689,8 +696,7 @@ class Build {
                 buildSource = context.readFile(buildSourcePath)
                 context.println "SUCCESS: buildSource.txt found"
             } catch (NoSuchFileException e) {
-                context.println "ERROR: ${buildSourcePath} was not found. Exiting..."
-                throw new Exception()
+                throw new Exception("ERROR: ${buildSourcePath} was not found. Exiting...")
             }
 
         }
@@ -855,8 +861,7 @@ class Build {
                 context.archiveArtifacts artifacts: "workspace/target/*"
             }
         } catch (FlowInterruptedException e) {
-            context.println "[ERROR] Build archive timeout (${buildTimeouts.BUILD_ARCHIVE_TIMEOUT} HOURS) has been reached. Exiting..."
-            throw new Exception()
+            throw new Exception("[ERROR] Build archive timeout (${buildTimeouts.BUILD_ARCHIVE_TIMEOUT} HOURS) has been reached. Exiting...")
         }
 
         // Setup params for downstream job & execute
@@ -901,30 +906,30 @@ class Build {
     Executed on a build node, the function checks out the repository and executes the build via ./make-adopt-build-farm.sh
     Once the build completes, it will calculate its version output, commit the first metadata writeout, and archive the build results.
     */
-    def buildScripts(cleanWorkspace, filename) {
+    def buildScripts(
+        cleanWorkspace,
+        cleanWorkspaceAfter,
+        cleanWorkspaceBuildOutputAfter,
+        filename,
+        useAdoptShellScripts
+    ) {
         return context.stage("build") {
-
             if (cleanWorkspace) {
                 try {
 
                     try {
                         context.timeout(time: buildTimeouts.NODE_CLEAN_TIMEOUT, unit: "HOURS") {
-                            if (buildConfig.TARGET_OS == "windows") {
-                                // Windows machines struggle to clean themselves, see:
-                                // https://github.com/AdoptOpenJDK/openjdk-build/issues/1855
-                                context.sh(script: "rm -rf C:/workspace/openjdk-build/workspace/build/src/build/*/jdk/gensrc")
-                                // https://github.com/AdoptOpenJDK/openjdk-infrastructure/issues/1419
-                                context.sh(script: "rm -rf J:/jenkins/tmp/workspace/build/src/build/*/jdk/gensrc")
-                                // https://github.com/AdoptOpenJDK/openjdk-infrastructure/issues/1662
-                                context.sh(script: "rm -rf E:/jenkins/tmp/workspace/build/src/build/*/jdk/gensrc")
-                                context.cleanWs notFailBuild: true, disableDeferredWipeout: true, deleteDirs: true
+                            // Note: Underlying org.apache DirectoryScanner used by cleanWs has a bug scanning where it misses files containing ".." so use rm -rf instead
+                            // Issue: https://issues.jenkins.io/browse/JENKINS-64779
+                            if (context.WORKSPACE != null && !context.WORKSPACE.isEmpty()) {
+                                context.println "Cleaning workspace files: " + context.WORKSPACE + "/*"
+                                context.sh(script: "rm -rf " + context.WORKSPACE + "/*")
                             } else {
-                                context.cleanWs notFailBuild: true
+                                context.println "Warning: Unable to clean workspace as context.WORKSPACE is null/empty"
                             }
                         }
                     } catch (FlowInterruptedException e) {
-                        context.println "[ERROR] Node Clean workspace timeout (${buildTimeouts.NODE_CLEAN_TIMEOUT} HOURS) has been reached. Exiting..."
-                        throw new Exception()
+                        throw new Exception("[ERROR] Node Clean workspace timeout (${buildTimeouts.NODE_CLEAN_TIMEOUT} HOURS) has been reached. Exiting...")
                     }
 
                 } catch (e) {
@@ -941,8 +946,7 @@ class Build {
                     context.sh(script: "git clean -fdx")
                 }
             } catch (FlowInterruptedException e) {
-                context.println "[ERROR] Node checkout workspace timeout (${buildTimeouts.NODE_CHECKOUT_TIMEOUT} HOURS) has been reached. Exiting..."
-                throw new Exception()
+                throw new Exception("[ERROR] Node checkout workspace timeout (${buildTimeouts.NODE_CHECKOUT_TIMEOUT} HOURS) has been reached. Exiting...")
             }
 
             try {
@@ -950,19 +954,34 @@ class Build {
                 List<String> envVars = buildConfig.toEnvVars()
                 envVars.add("FILENAME=${filename}" as String)
 
+                // Add in the adopt platform config path so it can be used if the user doesn't have one
+                def splitAdoptUrl = ((String)ADOPT_DEFAULTS_JSON['repository']['url']).minus(".git").split('/')
+                // e.g. https://github.com/AdoptOpenJDK/openjdk-build.git will produce AdoptOpenJDK/openjdk-build
+                String userOrgRepo = "${splitAdoptUrl[splitAdoptUrl.size() - 2]}/${splitAdoptUrl[splitAdoptUrl.size() - 1]}"
+                // e.g. AdoptOpenJDK/openjdk-build/master/build-farm/platform-specific-configurations
+                envVars.add("ADOPT_PLATFORM_CONFIG_LOCATION=${userOrgRepo}/${ADOPT_DEFAULTS_JSON['repository']['branch']}/${ADOPT_DEFAULTS_JSON['configDirectories']['platform']}" as String)
+
                 // Execute build
+                def repoHandler = new RepoHandler(context, USER_REMOTE_CONFIGS)
                 context.withEnv(envVars) {
                     try {
                         context.timeout(time: buildTimeouts.BUILD_JDK_TIMEOUT, unit: "HOURS") {
-                            context.sh(script: "./build-farm/make-adopt-build-farm.sh")
+                            if (useAdoptShellScripts) {
+                                context.println "[CHECKOUT] Checking out to AdoptOpenJDK/openjdk-build to use their bash scripts..."
+                                repoHandler.checkoutAdopt()
+                                context.sh(script: "./build-farm/make-adopt-build-farm.sh")
+                                context.println "[CHECKOUT] Reverting pre-build AdoptOpenJDK/openjdk-build checkout..."
+                                repoHandler.checkoutUser()
+                            } else {
+                                context.println "[INFO] Executing user bash scripts..."
+                                context.sh(script: "./build-farm/make-adopt-build-farm.sh")
+                            }
                         }
                     } catch (FlowInterruptedException e) {
-                        context.println "[ERROR] Build JDK timeout (${buildTimeouts.BUILD_JDK_TIMEOUT} HOURS) has been reached. Exiting..."
-                        throw new Exception()
+                        throw new Exception("[ERROR] Build JDK timeout (${buildTimeouts.BUILD_JDK_TIMEOUT} HOURS) has been reached. Exiting...")
                     }
 
-                    // Run a downstream job on riscv machine that returns the java version
-                    // otherwise, just read the version.txt
+                    // Run a downstream job on riscv machine that returns the java version. Otherwise, just read the version.txt
                     String versionOut
                     if (buildConfig.BUILD_ARGS.contains('--cross-compile')) {
                         context.println "[WARNING] Don't read faked version.txt on cross compiled build! Archiving early and running downstream job to retrieve java version..."
@@ -987,21 +1006,31 @@ class Build {
                         }
                     }
                 } catch (FlowInterruptedException e) {
-                    context.println "[ERROR] Build archive timeout (${buildTimeouts.BUILD_ARCHIVE_TIMEOUT} HOURS) has been reached. Exiting..."
-                    throw new Exception()
+                    throw new Exception("[ERROR] Build archive timeout (${buildTimeouts.BUILD_ARCHIVE_TIMEOUT} HOURS) has been reached. Exiting...")
                 }
             } finally {
                 // post-build workspace clean:
-                //   AIX due to limited ram drive space
-                //   s390x due to limited available disk space on Marist nodes 
-                if (buildConfig.TARGET_OS == "aix" || buildConfig.ARCHITECTURE == "s390x") {
+                if (cleanWorkspaceAfter || cleanWorkspaceBuildOutputAfter) {
                     try {
-                        context.timeout(time: buildTimeouts.AIX_CLEAN_TIMEOUT, unit: "HOURS") {
-                            context.cleanWs notFailBuild: true
+                        context.timeout(time: buildTimeouts.NODE_CLEAN_TIMEOUT, unit: "HOURS") {
+                            // Note: Underlying org.apache DirectoryScanner used by cleanWs has a bug scanning where it misses files containing ".." so use rm -rf instead
+                            // Issue: https://issues.jenkins.io/browse/JENKINS-64779
+                            if (context.WORKSPACE != null && !context.WORKSPACE.isEmpty()) {
+                                if (cleanWorkspaceAfter) {
+                                    context.println "Cleaning workspace files: " + context.WORKSPACE + "/*"
+                                    context.sh(script: "rm -rf " + context.WORKSPACE + "/*")
+                                } else if (cleanWorkspaceBuildOutputAfter) {
+                                    context.println "Cleaning workspace build output files: " + context.WORKSPACE + "/workspace/build/src/build"
+                                    context.sh(script: "rm -rf " + context.WORKSPACE + "/workspace/build/src/build")
+                                    context.println "Cleaning workspace build output files: " + context.WORKSPACE + "/workspace/target"
+                                    context.sh(script: "rm -rf " + context.WORKSPACE + "/workspace/target")
+                                }
+                            } else {
+                                context.println "Warning: Unable to clean workspace as context.WORKSPACE is null/empty"
+                            }
                         }
                     } catch (FlowInterruptedException e) {
-                        context.println "[ERROR] AIX clean workspace timeout (${buildTimeouts.AIX_CLEAN_TIMEOUT} HOURS) has been reached. Exiting..."
-                        throw new Exception()
+                        throw new Exception("[ERROR] AIX clean workspace timeout (${buildTimeouts.AIX_CLEAN_TIMEOUT} HOURS) has been reached. Exiting...")
                     }
                 }
             }
@@ -1041,11 +1070,9 @@ class Build {
                 }
                 x++
             }
-            context.error("No node matching this label became active prior to the timeout: " + label)
-            throw new Exception()
+            throw new Exception("No node matching this label became active prior to the timeout: " + label)
         } else {
-            context.error("As the timeout value is set to 0, we will not wait for a node to become active.")
-            throw new Exception()
+            throw new Exception("As the timeout value is set to 0, we will not wait for a node to become active.")
         }
     }
 
@@ -1068,11 +1095,14 @@ class Build {
                 def enableTests = Boolean.valueOf(buildConfig.ENABLE_TESTS)
                 def enableInstallers = Boolean.valueOf(buildConfig.ENABLE_INSTALLERS)
                 def enableSigner = Boolean.valueOf(buildConfig.ENABLE_SIGNER)
+                def useAdoptShellScripts = Boolean.valueOf(buildConfig.USE_ADOPT_SHELL_SCRIPTS)
                 def cleanWorkspace = Boolean.valueOf(buildConfig.CLEAN_WORKSPACE)
+                def cleanWorkspaceAfter = Boolean.valueOf(buildConfig.CLEAN_WORKSPACE_AFTER)
+                def cleanWorkspaceBuildOutputAfter = Boolean.valueOf(buildConfig.CLEAN_WORKSPACE_BUILD_OUTPUT_ONLY_AFTER)
 
                 context.stage("queue") {
                     /* This loads the library containing two Helper classes, and causes them to be
-                    imported/updated from their repo. Without the library being imported here, runTests 
+                    imported/updated from their repo. Without the library being imported here, runTests
                     method will fail to execute the post-build test jobs for reasons unknown.
                     */
                     context.library(identifier: 'openjdk-jenkins-helper@master')
@@ -1106,8 +1136,7 @@ class Build {
                                         }
                                     }
                                 } catch (FlowInterruptedException e) {
-                                    context.println "[ERROR] Master clean workspace timeout (${buildTimeouts.MASTER_CLEAN_TIMEOUT} HOURS) has been reached. Exiting..."
-                                    throw new Exception()
+                                    throw new Exception("[ERROR] Master clean workspace timeout (${buildTimeouts.MASTER_CLEAN_TIMEOUT} HOURS) has been reached. Exiting...")
                                 }
 
                             }
@@ -1123,13 +1152,13 @@ class Build {
                                         context.sh(script: "git clean -fdx")
                                     }
                                 } catch (FlowInterruptedException e) {
-                                    context.println "[ERROR] Master docker file scm checkout timeout (${buildTimeouts.DOCKER_CHECKOUT_TIMEOUT} HOURS) has been reached. Exiting..."
-                                    throw new Exception()
+                                    throw new Exception("[ERROR] Master docker file scm checkout timeout (${buildTimeouts.DOCKER_CHECKOUT_TIMEOUT} HOURS) has been reached. Exiting...")
                                 }
 
                                 context.docker.build("build-image", "--build-arg image=${buildConfig.DOCKER_IMAGE} -f ${buildConfig.DOCKER_FILE} .").inside {
-                                    buildScripts(cleanWorkspace, filename)
+                                    buildScripts(cleanWorkspace, cleanWorkspaceAfter, cleanWorkspaceBuildOutputAfter, filename, useAdoptShellScripts)
                                 }
+
                             // Otherwise, pull the docker image from DockerHub
                             } else {
                                 try {
@@ -1137,12 +1166,11 @@ class Build {
                                         context.docker.image(buildConfig.DOCKER_IMAGE).pull()
                                     }
                                 } catch (FlowInterruptedException e) {
-                                    context.println "[ERROR] Master docker image pull timeout (${buildTimeouts.DOCKER_PULL_TIMEOUT} HOURS) has been reached. Exiting..."
-                                    throw new Exception()
+                                    throw new Exception("[ERROR] Master docker image pull timeout (${buildTimeouts.DOCKER_PULL_TIMEOUT} HOURS) has been reached. Exiting...")
                                 }
 
                                 context.docker.image(buildConfig.DOCKER_IMAGE).inside {
-                                    buildScripts(cleanWorkspace, filename)
+                                    buildScripts(cleanWorkspace, cleanWorkspaceAfter, cleanWorkspaceBuildOutputAfter, filename, useAdoptShellScripts)
                                 }
                             }
                         }
@@ -1151,7 +1179,7 @@ class Build {
                     // Build the jdk outside of docker container...
                     } else {
                         waitForANodeToBecomeActive(buildConfig.NODE_LABEL)
-                        context.println "[NODE SHIFT] MOVING INTO NODE MATCHING LABELNAME ${buildConfig.NODE_LABEL}..."
+                        context.println "[NODE SHIFT] MOVING INTO JENKINS NODE MATCHING LABELNAME ${buildConfig.NODE_LABEL}..."
                         context.node(buildConfig.NODE_LABEL) {
                             // This is to avoid windows path length issues.
                             context.echo("checking ${buildConfig.TARGET_OS}")
@@ -1163,13 +1191,13 @@ class Build {
                                 }
                                 context.echo("changing ${workspace}")
                                 context.ws(workspace) {
-                                    buildScripts(cleanWorkspace, filename)
+                                    buildScripts(cleanWorkspace, cleanWorkspaceAfter, cleanWorkspaceBuildOutputAfter, filename, useAdoptShellScripts)
                                 }
                             } else {
-                                buildScripts(cleanWorkspace, filename)
+                                buildScripts(cleanWorkspace, cleanWorkspaceAfter, cleanWorkspaceBuildOutputAfter, filename, useAdoptShellScripts)
                             }
                         }
-                        context.println "[NODE SHIFT] OUT OF NODE (LABELNAME ${buildConfig.NODE_LABEL}!)"
+                        context.println "[NODE SHIFT] OUT OF JENKINS NODE (LABELNAME ${buildConfig.NODE_LABEL}!)"
                     }
                 }
 
@@ -1179,8 +1207,7 @@ class Build {
                         // Sign job timeout managed by Jenkins job config
                         sign(versionInfo)
                     } catch (FlowInterruptedException e) {
-                        context.println "[ERROR] downstream sign job failed. Exiting..."
-                        throw new Exception()
+                        throw new Exception("[ERROR] Sign job timeout (${buildTimeouts.SIGN_JOB_TIMEOUT} HOURS) has been reached OR the downstream sign job failed. Exiting...")
                     }
                 }
 
@@ -1200,8 +1227,7 @@ class Build {
                         // Installer job timeout managed by Jenkins job config
                         buildInstaller(versionInfo)
                     } catch (FlowInterruptedException e) {
-                        context.println "[ERROR] downstream installer job failed. Exiting..."
-                        throw new Exception()
+                        throw new Exception("[ERROR] Installer job timeout (${buildTimeouts.INSTALLER_JOBS_TIMEOUT} HOURS) has been reached OR the downstream installer job failed. Exiting...")
                     }
                 }
 
@@ -1220,6 +1246,9 @@ class Build {
 
 return {
     buildConfigArg,
+    USER_REMOTE_CONFIGS,
+    DEFAULTS_JSON,
+    ADOPT_DEFAULTS_JSON,
     context,
     env,
     currentBuild ->
@@ -1231,8 +1260,12 @@ return {
         }
 
         return new Build(
-                buildConfig,
-                context,
-                env,
-                currentBuild)
+            buildConfig,
+            USER_REMOTE_CONFIGS,
+            DEFAULTS_JSON,
+            ADOPT_DEFAULTS_JSON,
+            context,
+            env,
+            currentBuild
+        )
 }
